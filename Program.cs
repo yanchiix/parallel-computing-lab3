@@ -23,6 +23,8 @@ namespace Lab3Pool
         private readonly Dictionary<uint, JobState> _statusMap = new Dictionary<uint, JobState>();
 
         private uint _nextId;
+        private uint _opCount;
+        private uint _lenSum;
 
         public bool IsEmpty()
         {
@@ -37,12 +39,32 @@ namespace Lab3Pool
             }
         }
 
+        public double AvgLen()
+        {
+            _qLock.EnterReadLock();
+            try
+            {
+                if (_opCount == 0)
+                {
+                    return 0.0;
+                }
+
+                return Math.Round((double)_lenSum / _opCount, 2);
+            }
+            finally
+            {
+                _qLock.ExitReadLock();
+            }
+        }
+
         public uint Push(TTask task)
         {
             _qLock.EnterWriteLock();
             try
             {
                 _nextId++;
+                _opCount++;
+                _lenSum += (uint)_q.Count;
                 _q.Enqueue((_nextId, task));
                 AddState(_nextId);
                 return _nextId;
@@ -65,6 +87,8 @@ namespace Lab3Pool
                     return false;
                 }
 
+                _opCount++;
+                _lenSum += (uint)_q.Count;
                 (id, task) = _q.Dequeue();
                 return true;
             }
@@ -132,9 +156,15 @@ namespace Lab3Pool
         private readonly object _sync = new object();
         private readonly List<Thread> _threads = new List<Thread>();
         private readonly MyQueue<JobFunc> _q = new MyQueue<JobFunc>();
+        private readonly Dictionary<uint, int> _ans = new Dictionary<uint, int>();
+        private readonly ReaderWriterLockSlim _ansLock = new ReaderWriterLockSlim();
 
         private bool _isInit;
         private bool _stopAfterAll;
+
+        private long _idleTicks;
+        private long _jobTicks;
+        private int _cycles;
         private int _thrCount;
 
         public void StartPool(int thrCount)
@@ -204,9 +234,56 @@ namespace Lab3Pool
             return _q.GetState(id);
         }
 
+        public int TaskAns(uint id)
+        {
+            _ansLock.EnterReadLock();
+            try
+            {
+                if (!_ans.TryGetValue(id, out int res))
+                {
+                    throw new InvalidOperationException("Результат для вказаного ID відсутній.");
+                }
+
+                return res;
+            }
+            finally
+            {
+                _ansLock.ExitReadLock();
+            }
+        }
+
+        public double AvgQueue()
+        {
+            return _q.AvgLen();
+        }
+
         public int ThreadCount()
         {
             return _thrCount;
+        }
+
+        public void ShowStat()
+        {
+            Console.WriteLine();
+            Console.WriteLine("===== STATISTICS =====");
+            Console.WriteLine($"Created threads: {ThreadCount()}");
+            Console.WriteLine($"Average queue length: {AvgQueue():F2}");
+
+            if (_cycles > 0)
+            {
+                double waitMs = (double)_idleTicks / _cycles / TimeSpan.TicksPerMillisecond;
+                double workMs = (double)_jobTicks / _cycles / TimeSpan.TicksPerMillisecond;
+
+                Console.WriteLine($"Average thread wait time: {waitMs:F2} ms");
+                Console.WriteLine($"Average task execution time: {workMs:F2} ms");
+            }
+            else
+            {
+                Console.WriteLine("No jobs were processed.");
+            }
+
+            Console.WriteLine("======================");
+            Console.WriteLine();
         }
 
         private void WorkLoop()
@@ -215,6 +292,7 @@ namespace Lab3Pool
             {
                 JobFunc job;
                 uint id;
+                long waitBeg = DateTime.UtcNow.Ticks;
 
                 lock (_sync)
                 {
@@ -234,9 +312,29 @@ namespace Lab3Pool
                     }
                 }
 
+                long waitEnd = DateTime.UtcNow.Ticks;
+                Interlocked.Add(ref _idleTicks, waitEnd - waitBeg);
+
                 _q.SetState(id, JobState.Work);
-                job(CancellationToken.None);
+
+                long workBeg = DateTime.UtcNow.Ticks;
+                int res = job(CancellationToken.None);
+                long workEnd = DateTime.UtcNow.Ticks;
+
+                Interlocked.Add(ref _jobTicks, workEnd - workBeg);
+
+                _ansLock.EnterWriteLock();
+                try
+                {
+                    _ans[id] = res;
+                }
+                finally
+                {
+                    _ansLock.ExitWriteLock();
+                }
+
                 _q.SetState(id, JobState.Done);
+                Interlocked.Increment(ref _cycles);
             }
         }
 
@@ -264,6 +362,7 @@ namespace Lab3Pool
         public void Dispose()
         {
             StopAfterQueue();
+            _ansLock.Dispose();
         }
     }
 
@@ -312,6 +411,7 @@ namespace Lab3Pool
             prod2.Join();
 
             pool.StopAfterQueue();
+            pool.ShowStat();
         }
     }
 }
