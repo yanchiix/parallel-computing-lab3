@@ -127,13 +127,14 @@ namespace Lab3Pool
         }
     }
 
-    public sealed class MyPool
+    public sealed class MyPool : IDisposable
     {
         private readonly object _sync = new object();
         private readonly List<Thread> _threads = new List<Thread>();
         private readonly MyQueue<JobFunc> _q = new MyQueue<JobFunc>();
 
         private bool _isInit;
+        private bool _stopAfterAll;
         private int _thrCount;
 
         public void StartPool(int thrCount)
@@ -170,7 +171,7 @@ namespace Lab3Pool
         {
             lock (_sync)
             {
-                if (!_isInit)
+                if (!_isInit || _stopAfterAll)
                 {
                     return 0;
                 }
@@ -179,6 +180,23 @@ namespace Lab3Pool
                 Monitor.Pulse(_sync);
                 return id;
             }
+        }
+
+        public void StopAfterQueue()
+        {
+            lock (_sync)
+            {
+                if (!_isInit)
+                {
+                    return;
+                }
+
+                _stopAfterAll = true;
+                Monitor.PulseAll(_sync);
+            }
+
+            WaitThreads();
+            ClearFlags();
         }
 
         public JobState StateById(uint id)
@@ -200,8 +218,18 @@ namespace Lab3Pool
 
                 lock (_sync)
                 {
-                    while (!_q.Pop(out id, out job))
+                    while (true)
                     {
+                        if (_q.Pop(out id, out job))
+                        {
+                            break;
+                        }
+
+                        if (_stopAfterAll && _q.IsEmpty())
+                        {
+                            return;
+                        }
+
                         Monitor.Wait(_sync);
                     }
                 }
@@ -210,6 +238,32 @@ namespace Lab3Pool
                 job(CancellationToken.None);
                 _q.SetState(id, JobState.Done);
             }
+        }
+
+        private void WaitThreads()
+        {
+            foreach (Thread t in _threads)
+            {
+                if (t.IsAlive)
+                {
+                    t.Join();
+                }
+            }
+        }
+
+        private void ClearFlags()
+        {
+            lock (_sync)
+            {
+                _threads.Clear();
+                _isInit = false;
+                _stopAfterAll = false;
+            }
+        }
+
+        public void Dispose()
+        {
+            StopAfterQueue();
         }
     }
 
@@ -220,9 +274,27 @@ namespace Lab3Pool
 
         private static int FakeTask(CancellationToken token)
         {
-            int sec = Rnd.Value!.Next(3, 7);
+            int sec = Rnd.Value!.Next(5, 11);
             Thread.Sleep(sec * 1000);
             return sec;
+        }
+
+        private static void AddTasks(object? obj)
+        {
+            if (obj is not MyPool pool)
+            {
+                return;
+            }
+
+            for (int i = 0; i < 10; i++)
+            {
+                Thread.Sleep(Rnd.Value!.Next(1, 6) * 1000);
+                uint id = pool.PushTask(FakeTask);
+                if (id != 0)
+                {
+                    Console.WriteLine($"Task {id} added.");
+                }
+            }
         }
 
         private static void Main()
@@ -230,15 +302,16 @@ namespace Lab3Pool
             MyPool pool = new MyPool();
             pool.StartPool(4);
 
-            for (int i = 0; i < 8; i++)
-            {
-                uint id = pool.PushTask(FakeTask);
-                Console.WriteLine($"Task {id} added.");
-                Thread.Sleep(500);
-            }
+            Thread prod1 = new Thread(AddTasks);
+            Thread prod2 = new Thread(AddTasks);
 
-            Console.WriteLine($"Threads: {pool.ThreadCount()}");
-            Thread.Sleep(20000);
+            prod1.Start(pool);
+            prod2.Start(pool);
+
+            prod1.Join();
+            prod2.Join();
+
+            pool.StopAfterQueue();
         }
     }
 }
