@@ -26,6 +26,19 @@ namespace Lab3Pool
         private uint _opCount;
         private uint _lenSum;
 
+        public int Count()
+        {
+            _qLock.EnterReadLock();
+            try
+            {
+                return _q.Count;
+            }
+            finally
+            {
+                _qLock.ExitReadLock();
+            }
+        }
+
         public bool IsEmpty()
         {
             _qLock.EnterReadLock();
@@ -89,6 +102,7 @@ namespace Lab3Pool
 
                 _opCount++;
                 _lenSum += (uint)_q.Count;
+
                 (id, task) = _q.Dequeue();
                 return true;
             }
@@ -96,6 +110,27 @@ namespace Lab3Pool
             {
                 _qLock.ExitWriteLock();
             }
+        }
+
+        public List<uint> TakeAllIds()
+        {
+            List<uint> ids = new List<uint>();
+
+            _qLock.EnterWriteLock();
+            try
+            {
+                while (_q.Count > 0)
+                {
+                    var item = _q.Dequeue();
+                    ids.Add(item.Id);
+                }
+            }
+            finally
+            {
+                _qLock.ExitWriteLock();
+            }
+
+            return ids;
         }
 
         public bool AddState(uint id)
@@ -158,9 +193,12 @@ namespace Lab3Pool
         private readonly MyQueue<JobFunc> _q = new MyQueue<JobFunc>();
         private readonly Dictionary<uint, int> _ans = new Dictionary<uint, int>();
         private readonly ReaderWriterLockSlim _ansLock = new ReaderWriterLockSlim();
+        private readonly CancellationTokenSource _cts = new CancellationTokenSource();
 
         private bool _isInit;
         private bool _stopAfterAll;
+        private bool _stopNow;
+        private bool _isPaused;
 
         private long _idleTicks;
         private long _jobTicks;
@@ -197,11 +235,39 @@ namespace Lab3Pool
             }
         }
 
+        public bool Working()
+        {
+            lock (_sync)
+            {
+                return _isInit && !_stopAfterAll && !_stopNow;
+            }
+        }
+
+        public void PausePool()
+        {
+            lock (_sync)
+            {
+                if (_isInit && !_stopAfterAll && !_stopNow)
+                {
+                    _isPaused = true;
+                }
+            }
+        }
+
+        public void ContinuePool()
+        {
+            lock (_sync)
+            {
+                _isPaused = false;
+                Monitor.PulseAll(_sync);
+            }
+        }
+
         public uint PushTask(JobFunc task)
         {
             lock (_sync)
             {
-                if (!_isInit || _stopAfterAll)
+                if (!_isInit || _stopAfterAll || _stopNow)
                 {
                     return 0;
                 }
@@ -222,6 +288,35 @@ namespace Lab3Pool
                 }
 
                 _stopAfterAll = true;
+                _isPaused = false;
+                Monitor.PulseAll(_sync);
+            }
+
+            WaitThreads();
+            ClearFlags();
+        }
+
+        public void StopFast()
+        {
+            List<uint> leftIds;
+
+            lock (_sync)
+            {
+                if (!_isInit)
+                {
+                    return;
+                }
+
+                _stopNow = true;
+                _isPaused = false;
+                _cts.Cancel();
+                leftIds = _q.TakeAllIds();
+
+                foreach (uint id in leftIds)
+                {
+                    _q.SetState(id, JobState.Stop);
+                }
+
                 Monitor.PulseAll(_sync);
             }
 
@@ -298,7 +393,12 @@ namespace Lab3Pool
                 {
                     while (true)
                     {
-                        if (_q.Pop(out id, out job))
+                        if (_stopNow)
+                        {
+                            return;
+                        }
+
+                        if (!_isPaused && _q.Pop(out id, out job))
                         {
                             break;
                         }
@@ -318,23 +418,35 @@ namespace Lab3Pool
                 _q.SetState(id, JobState.Work);
 
                 long workBeg = DateTime.UtcNow.Ticks;
-                int res = job(CancellationToken.None);
-                long workEnd = DateTime.UtcNow.Ticks;
-
-                Interlocked.Add(ref _jobTicks, workEnd - workBeg);
-
-                _ansLock.EnterWriteLock();
                 try
                 {
-                    _ans[id] = res;
+                    int res = job(_cts.Token);
+                    long workEnd = DateTime.UtcNow.Ticks;
+
+                    Interlocked.Add(ref _jobTicks, workEnd - workBeg);
+
+                    _ansLock.EnterWriteLock();
+                    try
+                    {
+                        _ans[id] = res;
+                    }
+                    finally
+                    {
+                        _ansLock.ExitWriteLock();
+                    }
+
+                    _q.SetState(id, JobState.Done);
+                }
+                catch (OperationCanceledException)
+                {
+                    long workEnd = DateTime.UtcNow.Ticks;
+                    Interlocked.Add(ref _jobTicks, workEnd - workBeg);
+                    _q.SetState(id, JobState.Stop);
                 }
                 finally
                 {
-                    _ansLock.ExitWriteLock();
+                    Interlocked.Increment(ref _cycles);
                 }
-
-                _q.SetState(id, JobState.Done);
-                Interlocked.Increment(ref _cycles);
             }
         }
 
@@ -355,13 +467,16 @@ namespace Lab3Pool
             {
                 _threads.Clear();
                 _isInit = false;
+                _isPaused = false;
                 _stopAfterAll = false;
+                _stopNow = false;
             }
         }
 
         public void Dispose()
         {
             StopAfterQueue();
+            _cts.Dispose();
             _ansLock.Dispose();
         }
     }
@@ -374,7 +489,16 @@ namespace Lab3Pool
         private static int FakeTask(CancellationToken token)
         {
             int sec = Rnd.Value!.Next(5, 11);
-            Thread.Sleep(sec * 1000);
+            int allMs = sec * 1000;
+            int curMs = 0;
+
+            while (curMs < allMs)
+            {
+                token.ThrowIfCancellationRequested();
+                Thread.Sleep(100);
+                curMs += 100;
+            }
+
             return sec;
         }
 
@@ -407,10 +531,24 @@ namespace Lab3Pool
             prod1.Start(pool);
             prod2.Start(pool);
 
+            // демонстрація паузи / відновлення
+            Thread.Sleep(7000);
+            Console.WriteLine("\nPOOL PAUSED\n");
+            pool.PausePool();
+
+            Thread.Sleep(4000);
+            Console.WriteLine("\nPOOL RESUMED\n");
+            pool.ContinuePool();
+
             prod1.Join();
             prod2.Join();
 
+            // коректне завершення після виконання всіх задач
             pool.StopAfterQueue();
+
+            // для перевірки режиму миттєвого завершення
+            // pool.StopFast();
+
             pool.ShowStat();
         }
     }
